@@ -1,0 +1,22 @@
+[package]
+name = "nih_plug_druid"
+version = "0.0.0"
+edition = "2021"
+authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>"]
+license = "ISC"
+
+description = "An adapter to use Druid GUIs with NIH-plug"
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default-features = false }
+druid = "0.8.3"
+
+crossbeam = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+	"Win32_Foundation",
+	"Win32_System_Threading",
+	"Win32_UI_WindowsAndMessaging",
+] }

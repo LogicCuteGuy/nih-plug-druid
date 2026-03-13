@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+  "nih_plug_druid",
+  "examples/gain_gui_druid",
+  "xtask",
+]

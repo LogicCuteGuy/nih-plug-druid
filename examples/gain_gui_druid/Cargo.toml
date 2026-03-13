@@ -1,0 +1,18 @@
+[package]
+name = "gain_gui_druid"
+version = "0.1.0"
+edition = "2021"
+authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>"]
+license = "ISC"
+
+description = "A simple gain plugin with a Druid GUI"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone"] }
+nih_plug_druid = { path = "../../nih_plug_druid" }
+druid = "0.8.3"
+
+atomic_float = "0.1"
