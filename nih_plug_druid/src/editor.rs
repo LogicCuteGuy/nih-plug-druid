@@ -2,6 +2,8 @@ use crossbeam::atomic::AtomicCell;
 use druid::{commands, AppLauncher, ExtEventSink, Target};
 use nih_plug::debug::*;
 use nih_plug::prelude::{Editor, GuiContext, ParentWindowHandle};
+#[cfg(target_os = "macos")]
+use std::ffi::{c_char, CStr};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -10,6 +12,15 @@ use std::time::Duration;
 
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
+
+#[cfg(target_os = "macos")]
+use cocoa::appkit::NSApp;
+#[cfg(target_os = "macos")]
+use cocoa::base::{id, nil, NO, YES};
+#[cfg(target_os = "macos")]
+use cocoa::foundation::{NSInteger, NSRect};
+#[cfg(target_os = "macos")]
+use objc::{msg_send, sel, sel_impl};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
@@ -89,6 +100,35 @@ where
             }
         }
 
+        #[cfg(target_os = "macos")]
+        if let ParentWindowHandle::AppKitNsView(parent_ns_view) = parent {
+            if let Some(child_window) = find_druid_window(Duration::from_secs(5)) {
+                let mut embedded = false;
+                // Host views are sometimes not fully initialized yet when spawn() returns.
+                for _ in 0..120 {
+                    unsafe {
+                        if embed_child_window_macos(child_window, parent_ns_view as id) {
+                            for _ in 0..50 {
+                                let _ = sync_child_window_frame_macos(child_window, parent_ns_view as id);
+                                thread::sleep(Duration::from_millis(10));
+                            }
+
+                            embedded = true;
+                            break;
+                        }
+                    }
+
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                if !embedded {
+                    nih_error!("Failed to embed Druid window into host AppKit view");
+                }
+            } else {
+                nih_error!("Failed to find Druid window for host embedding");
+            }
+        }
+
         self.druid_state.open.store(true, Ordering::Release);
         Box::new(DruidEditorHandle {
             druid_state: self.druid_state.clone(),
@@ -125,10 +165,17 @@ struct DruidEditorHandle {
 
 impl Drop for DruidEditorHandle {
     fn drop(&mut self) {
+        #[cfg(not(target_os = "macos"))]
         self.druid_state.open.store(false, Ordering::Release);
 
         if let Some(event_sink) = &self.event_sink {
+            #[cfg(target_os = "macos")]
+            let _ = event_sink.submit_command(commands::CLOSE_ALL_WINDOWS, (), Target::Global);
+
+            #[cfg(not(target_os = "macos"))]
             let _ = event_sink.submit_command(commands::QUIT_APP, (), Target::Global);
+        } else {
+            self.druid_state.open.store(false, Ordering::Release);
         }
 
         if let Some(thread) = self.thread.take() {
@@ -140,6 +187,123 @@ impl Drop for DruidEditorHandle {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn find_druid_window(timeout: Duration) -> Option<id> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Some(window) = unsafe { find_druid_window_once() } {
+            return Some(window);
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    None
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+unsafe fn find_druid_window_once() -> Option<id> {
+    let app = NSApp();
+    if app == nil {
+        return None;
+    }
+
+    let windows: id = msg_send![app, windows];
+    if windows == nil {
+        return None;
+    }
+
+    let count: usize = msg_send![windows, count];
+    for index in (0..count).rev() {
+        let window: id = msg_send![windows, objectAtIndex: index];
+        if window == nil {
+            continue;
+        }
+
+        let class_name: id = msg_send![window, className];
+        if class_name == nil {
+            continue;
+        }
+
+        let class_name_utf8: *const c_char = msg_send![class_name, UTF8String];
+        if class_name_utf8.is_null() {
+            continue;
+        }
+
+        let class_name_bytes = CStr::from_ptr(class_name_utf8).to_bytes();
+        let is_druid_window = class_name_bytes == b"DruidWindow"
+            || class_name_bytes.windows(5).any(|segment| segment == b"Druid");
+        if is_druid_window {
+            return Some(window);
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+unsafe fn embed_child_window_macos(child_window: id, parent_ns_view: id) -> bool {
+    if child_window == nil || parent_ns_view == nil {
+        return false;
+    }
+
+    let parent_window: id = msg_send![parent_ns_view, window];
+    if parent_window == nil {
+        return false;
+    }
+
+    if child_window == parent_window {
+        nih_error!("Refusing to embed host NSWindow as Druid child window");
+        return false;
+    }
+
+    let child_parent_window: id = msg_send![child_window, parentWindow];
+    if child_parent_window != nil && child_parent_window != parent_window {
+        let _: () = msg_send![child_parent_window, removeChildWindow: child_window];
+    }
+
+    let _: () = msg_send![child_window, setReleasedWhenClosed: NO];
+
+    if !sync_child_window_frame_macos(child_window, parent_ns_view) {
+        return false;
+    }
+
+    let _: () = msg_send![parent_window, addChildWindow: child_window ordered: NSWINDOW_ORDERING_MODE_ABOVE];
+    let _: () = msg_send![child_window, orderFront: nil];
+
+    true
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+unsafe fn sync_child_window_frame_macos(child_window: id, parent_ns_view: id) -> bool {
+    if child_window == nil || parent_ns_view == nil {
+        return false;
+    }
+
+    let parent_window: id = msg_send![parent_ns_view, window];
+    if parent_window == nil {
+        return false;
+    }
+
+    let bounds: NSRect = msg_send![parent_ns_view, bounds];
+    if bounds.size.width <= 1.0 || bounds.size.height <= 1.0 {
+        return false;
+    }
+
+    let rect_in_parent_window: NSRect = msg_send![parent_ns_view, convertRect: bounds toView: nil];
+    let screen_rect: NSRect = msg_send![parent_window, convertRectToScreen: rect_in_parent_window];
+    let _: () = msg_send![child_window, setFrame: screen_rect display: YES];
+
+    true
+}
+
+#[cfg(target_os = "macos")]
+const NSWINDOW_ORDERING_MODE_ABOVE: NSInteger = 1;
 
 #[cfg(target_os = "windows")]
 fn find_thread_window(thread_id: u32, timeout: Duration) -> Option<HWND> {

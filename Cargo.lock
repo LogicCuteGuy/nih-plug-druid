@@ -1600,9 +1600,11 @@ dependencies = [
 name = "nih_plug_druid"
 version = "0.0.0"
 dependencies = [
+ "cocoa",
  "crossbeam",
  "druid",
  "nih_plug",
+ "objc",
  "serde",
  "windows-sys 0.59.0",
 ]

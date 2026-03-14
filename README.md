@@ -34,3 +34,8 @@ Generated bundles are written to:
 
 - The example plugin crate is `gain_gui_druid`.
 - The adapter crate in this repository is `nih_plug_druid`.
+
+## Known issues
+
+- macOS: not working right now.
+- Linux: not working right now.
