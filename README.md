@@ -35,7 +35,23 @@ Generated bundles are written to:
 - The example plugin crate is `gain_gui_druid`.
 - The adapter crate in this repository is `nih_plug_druid`.
 
+## Platform notes
+
+### Linux
+
+On Linux, Druid requires gtk+3; see the GTK installation page. (On Ubuntu-based distros, running `sudo apt-get install libgtk-3-dev` from the terminal will do the job.)
+
+### OpenBSD
+
+On OpenBSD, Druid requires gtk+3; install from packages:
+
+```sh
+pkg_add gtk+3
+```
+
+Alternatively, there is an X11 backend available, although it is currently missing quite a few features. You can try it out with `--features=x11`.
+
 ## Known issues
 
-- macOS: not working right now.
-- Linux: not working right now.
+- Linux: still buggy (GUI close/reopen can be unstable depending on host).
+- macOS: still buggy.

@@ -4,14 +4,19 @@ use nih_plug::debug::*;
 use nih_plug::prelude::{Editor, GuiContext, ParentWindowHandle};
 #[cfg(target_os = "macos")]
 use std::ffi::{c_char, CStr};
+#[cfg(target_os = "linux")]
+use std::ffi::CStr;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use std::ffi::c_void;
+
+#[cfg(target_os = "linux")]
+use x11::xlib;
 
 #[cfg(target_os = "macos")]
 use cocoa::appkit::NSApp;
@@ -55,9 +60,26 @@ where
         parent: ParentWindowHandle,
         context: Arc<dyn GuiContext>,
     ) -> Box<dyn std::any::Any + Send> {
+        if self
+            .druid_state
+            .open
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            nih_warn!("Ignoring duplicate Druid editor spawn while an editor is still open");
+            return Box::new(DruidEditorHandle {
+                druid_state: self.druid_state.clone(),
+                event_sink: None,
+                thread: None,
+                owns_gui: false,
+            });
+        }
+
         let make_data = self.make_data.clone();
         let make_window = self.make_window.clone();
         let druid_state = self.druid_state.clone();
+        #[cfg(target_os = "linux")]
+        let existing_root_windows = unsafe { list_x11_root_windows() };
 
         let (sink_sender, sink_receiver) = mpsc::sync_channel(1);
         #[cfg(target_os = "windows")]
@@ -100,6 +122,25 @@ where
             }
         }
 
+        #[cfg(target_os = "linux")]
+        if let ParentWindowHandle::X11Window(parent_xid) = parent {
+            let (width, height) = self.druid_state.size();
+            let child_xid = unsafe {
+                find_new_x11_window(
+                    parent_xid as u64,
+                    existing_root_windows.as_deref().unwrap_or(&[]),
+                    Duration::from_secs(5),
+                )
+            };
+            if let Some(child_xid) = child_xid {
+                unsafe {
+                    embed_x11_window(child_xid, parent_xid as u64, width, height);
+                }
+            } else {
+                nih_error!("Failed to find Druid window for host X11 embedding");
+            }
+        }
+
         #[cfg(target_os = "macos")]
         if let ParentWindowHandle::AppKitNsView(parent_ns_view) = parent {
             if let Some(child_window) = find_druid_window(Duration::from_secs(5)) {
@@ -129,11 +170,11 @@ where
             }
         }
 
-        self.druid_state.open.store(true, Ordering::Release);
         Box::new(DruidEditorHandle {
             druid_state: self.druid_state.clone(),
             event_sink: sink_receiver.recv_timeout(Duration::from_secs(2)).ok(),
             thread: Some(thread),
+            owns_gui: true,
         })
     }
 
@@ -161,29 +202,53 @@ struct DruidEditorHandle {
     druid_state: Arc<DruidState>,
     event_sink: Option<ExtEventSink>,
     thread: Option<JoinHandle<()>>,
+    owns_gui: bool,
 }
 
 impl Drop for DruidEditorHandle {
     fn drop(&mut self) {
-        #[cfg(not(target_os = "macos"))]
-        self.druid_state.open.store(false, Ordering::Release);
+        if !self.owns_gui {
+            return;
+        }
+
+        let mut thread_exited = false;
 
         if let Some(event_sink) = &self.event_sink {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             let _ = event_sink.submit_command(commands::CLOSE_ALL_WINDOWS, (), Target::Global);
 
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "windows")]
             let _ = event_sink.submit_command(commands::QUIT_APP, (), Target::Global);
-        } else {
-            self.druid_state.open.store(false, Ordering::Release);
+
+            #[cfg(target_os = "linux")]
+            let _ = event_sink.submit_command(commands::QUIT_APP, (), Target::Global);
         }
 
         if let Some(thread) = self.thread.take() {
+            #[cfg(target_os = "linux")]
+            let join_timeout = Duration::from_secs(5);
+            #[cfg(not(target_os = "linux"))]
+            let join_timeout = Duration::from_secs(2);
+
+            let deadline = std::time::Instant::now() + join_timeout;
+            while !thread.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+
             if thread.is_finished() {
                 let _ = thread.join();
+                thread_exited = true;
             } else {
                 nih_warn!("Druid GUI thread is still running; detaching thread to avoid host UI hang");
             }
+        } else {
+            thread_exited = true;
+        }
+
+        // If the thread is still running then its launcher will clear the open flag on exit.
+        // Keeping the state open here avoids reopening a second GUI while the first is alive.
+        if thread_exited {
+            self.druid_state.open.store(false, Ordering::Release);
         }
     }
 }
@@ -374,4 +439,137 @@ unsafe fn embed_as_child_window(
         height,
         SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER | SWP_SHOWWINDOW,
     );
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn list_x11_root_windows() -> Option<Vec<u64>> {
+    let display = xlib::XOpenDisplay(std::ptr::null());
+    if display.is_null() {
+        return None;
+    }
+
+    let screen = xlib::XDefaultScreen(display);
+    let root = xlib::XRootWindow(display, screen);
+    let windows = query_x11_children(display, root);
+
+    xlib::XCloseDisplay(display);
+    Some(windows)
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn query_x11_children(display: *mut xlib::Display, window: xlib::Window) -> Vec<u64> {
+    let mut root_ret: xlib::Window = 0;
+    let mut parent_ret: xlib::Window = 0;
+    let mut children: *mut xlib::Window = std::ptr::null_mut();
+    let mut nchildren: u32 = 0;
+
+    let mut result = Vec::new();
+    if xlib::XQueryTree(
+        display,
+        window,
+        &mut root_ret,
+        &mut parent_ret,
+        &mut children,
+        &mut nchildren,
+    ) != 0
+    {
+        if !children.is_null() && nchildren > 0 {
+            for i in 0..nchildren as isize {
+                result.push(*children.offset(i));
+            }
+
+            xlib::XFree(children as *mut c_void);
+        }
+    }
+
+    result
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn find_new_x11_window(
+    parent_xid: u64,
+    existing_windows: &[u64],
+    timeout: Duration,
+) -> Option<u64> {
+    let display = xlib::XOpenDisplay(std::ptr::null());
+    if display.is_null() {
+        return None;
+    }
+
+    let screen = xlib::XDefaultScreen(display);
+    let root = xlib::XRootWindow(display, screen);
+    let deadline = std::time::Instant::now() + timeout;
+
+    while std::time::Instant::now() < deadline {
+        let windows = query_x11_children(display, root);
+        for &window in windows.iter().rev() {
+            if window == parent_xid || existing_windows.contains(&window) {
+                continue;
+            }
+
+            let mut attrs = std::mem::zeroed::<xlib::XWindowAttributes>();
+            if xlib::XGetWindowAttributes(display, window, &mut attrs) != 0
+                && attrs.map_state == xlib::IsViewable
+                && is_probably_druid_window(display, window)
+            {
+                xlib::XCloseDisplay(display);
+                return Some(window);
+            }
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    xlib::XCloseDisplay(display);
+    None
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn embed_x11_window(child_xid: u64, parent_xid: u64, width: u32, height: u32) {
+    if child_xid == parent_xid {
+        nih_error!("Refusing to embed parent X11 window as a child window");
+        return;
+    }
+
+    let display = xlib::XOpenDisplay(std::ptr::null());
+    if display.is_null() {
+        nih_error!("Failed to open X11 display for window embedding");
+        return;
+    }
+
+    xlib::XReparentWindow(display, child_xid, parent_xid, 0, 0);
+    xlib::XResizeWindow(display, child_xid, width, height);
+    xlib::XMapWindow(display, child_xid);
+    xlib::XFlush(display);
+    xlib::XCloseDisplay(display);
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn is_probably_druid_window(display: *mut xlib::Display, window: xlib::Window) -> bool {
+    let mut class_hint = std::mem::zeroed::<xlib::XClassHint>();
+    if xlib::XGetClassHint(display, window, &mut class_hint) == 0 {
+        return false;
+    }
+
+    let mut is_druid = false;
+
+    if !class_hint.res_name.is_null() {
+        let name = CStr::from_ptr(class_hint.res_name).to_bytes();
+        if name.windows(5).any(|segment| segment.eq_ignore_ascii_case(b"druid")) {
+            is_druid = true;
+        }
+
+        xlib::XFree(class_hint.res_name as *mut c_void);
+    }
+
+    if !class_hint.res_class.is_null() {
+        let class = CStr::from_ptr(class_hint.res_class).to_bytes();
+        if class.windows(5).any(|segment| segment.eq_ignore_ascii_case(b"druid")) {
+            is_druid = true;
+        }
+
+        xlib::XFree(class_hint.res_class as *mut c_void);
+    }
+
+    is_druid
 }
