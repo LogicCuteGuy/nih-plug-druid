@@ -211,8 +211,6 @@ impl Drop for DruidEditorHandle {
             return;
         }
 
-        let mut thread_exited = false;
-
         if let Some(event_sink) = &self.event_sink {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             let _ = event_sink.submit_command(commands::CLOSE_ALL_WINDOWS, (), Target::Global);
@@ -225,29 +223,17 @@ impl Drop for DruidEditorHandle {
         }
 
         if let Some(thread) = self.thread.take() {
-            #[cfg(target_os = "linux")]
-            let join_timeout = Duration::from_secs(5);
-            #[cfg(not(target_os = "linux"))]
-            let join_timeout = Duration::from_secs(2);
-
-            let deadline = std::time::Instant::now() + join_timeout;
-            while !thread.is_finished() && std::time::Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
-            }
-
             if thread.is_finished() {
                 let _ = thread.join();
-                thread_exited = true;
+                self.druid_state.open.store(false, Ordering::Release);
             } else {
-                nih_warn!("Druid GUI thread is still running; detaching thread to avoid host UI hang");
+                let druid_state = self.druid_state.clone();
+                thread::spawn(move || {
+                    let _ = thread.join();
+                    druid_state.open.store(false, Ordering::Release);
+                });
             }
         } else {
-            thread_exited = true;
-        }
-
-        // If the thread is still running then its launcher will clear the open flag on exit.
-        // Keeping the state open here avoids reopening a second GUI while the first is alive.
-        if thread_exited {
             self.druid_state.open.store(false, Ordering::Release);
         }
     }
