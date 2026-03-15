@@ -1,4 +1,5 @@
 use crossbeam::atomic::AtomicCell;
+use baseview::{EventStatus as BaseviewEventStatus, Window as BaseviewWindow, WindowHandle as BaseviewWindowHandle, WindowHandler as BaseviewWindowHandler, WindowOpenOptions, WindowScalePolicy};
 use druid::kurbo::{Affine, BezPath};
 use druid::{
     commands, AppLauncher, BoxConstraints, Color, Cursor, Data, Env, Event, EventCtx,
@@ -7,6 +8,7 @@ use druid::{
 };
 use nih_plug::debug::*;
 use nih_plug::prelude::{Editor, GuiContext, ParentWindowHandle};
+use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 #[cfg(target_os = "macos")]
 use std::ffi::{c_char, CStr};
 #[cfg(target_os = "linux")]
@@ -44,6 +46,64 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::{DruidState, ResizableScaleConfig};
+
+struct BaseviewParentWindowHandler;
+
+impl BaseviewWindowHandler for BaseviewParentWindowHandler {
+    fn on_frame(&mut self, _window: &mut BaseviewWindow) {}
+
+    fn on_event(&mut self, _window: &mut BaseviewWindow, _event: baseview::Event) -> BaseviewEventStatus {
+        BaseviewEventStatus::Ignored
+    }
+}
+
+struct ParentWindowHandleAdapter(ParentWindowHandle);
+
+unsafe impl HasRawWindowHandle for ParentWindowHandleAdapter {
+    fn raw_window_handle(&self) -> RawWindowHandle {
+        match self.0 {
+            ParentWindowHandle::X11Window(window) => {
+                let mut handle = raw_window_handle::XcbWindowHandle::empty();
+                handle.window = window;
+                RawWindowHandle::Xcb(handle)
+            }
+            ParentWindowHandle::AppKitNsView(ns_view) => {
+                let mut handle = raw_window_handle::AppKitWindowHandle::empty();
+                handle.ns_view = ns_view;
+                RawWindowHandle::AppKit(handle)
+            }
+            ParentWindowHandle::Win32Hwnd(hwnd) => {
+                let mut handle = raw_window_handle::Win32WindowHandle::empty();
+                handle.hwnd = hwnd;
+                RawWindowHandle::Win32(handle)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn baseview_parent_hwnd(window: &BaseviewWindowHandle) -> Option<*mut c_void> {
+    match window.raw_window_handle() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn baseview_parent_x11_window(window: &BaseviewWindowHandle) -> Option<u64> {
+    match window.raw_window_handle() {
+        RawWindowHandle::Xcb(handle) => Some(handle.window as u64),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn baseview_parent_ns_view(window: &BaseviewWindowHandle) -> Option<*mut c_void> {
+    match window.raw_window_handle() {
+        RawWindowHandle::AppKit(handle) => Some(handle.ns_view),
+        _ => None,
+    }
+}
 
 pub(crate) struct ResizableScale<T, W>
 where
@@ -366,6 +426,7 @@ where
                 druid_state: self.druid_state.clone(),
                 event_sink: None,
                 thread: None,
+                baseview_window: None,
                 owns_gui: false,
             });
         }
@@ -373,6 +434,32 @@ where
         let make_data = self.make_data.clone();
         let make_window = self.make_window.clone();
         let druid_state = self.druid_state.clone();
+        let (width, height) = self.druid_state.size();
+
+        let baseview_window = BaseviewWindow::open_parented(
+            &ParentWindowHandleAdapter(parent),
+            WindowOpenOptions {
+                title: String::from("nih_plug_druid"),
+                size: baseview::Size::new(width as f64, height as f64),
+                scale: self
+                    .scaling_factor
+                    .load()
+                    .map(|factor| WindowScalePolicy::ScaleFactor(factor as f64))
+                    .unwrap_or(WindowScalePolicy::SystemScaleFactor),
+                gl_config: None,
+            },
+            |_| BaseviewParentWindowHandler,
+        );
+
+        #[cfg(target_os = "windows")]
+        let baseview_parent_hwnd = baseview_parent_hwnd(&baseview_window);
+
+        #[cfg(target_os = "linux")]
+        let baseview_parent_xid = baseview_parent_x11_window(&baseview_window);
+
+        #[cfg(target_os = "macos")]
+        let baseview_parent_ns_view = baseview_parent_ns_view(&baseview_window);
+
         #[cfg(target_os = "linux")]
         let existing_root_windows = unsafe { list_x11_root_windows() };
 
@@ -399,48 +486,44 @@ where
         });
 
         #[cfg(target_os = "windows")]
-        if let ParentWindowHandle::Win32Hwnd(parent_hwnd) = parent {
+        if let Some(parent_hwnd) = baseview_parent_hwnd {
             if let Ok(thread_id) = thread_id_receiver.recv_timeout(Duration::from_secs(2)) {
-                let (width, height) = self.druid_state.size();
                 if let Some(child_hwnd) = find_thread_window(thread_id, Duration::from_secs(2)) {
                     unsafe {
-                        embed_as_child_window(
-                            child_hwnd,
-                            parent_hwnd,
-                            width as i32,
-                            height as i32,
-                        );
+                        embed_as_child_window(child_hwnd, parent_hwnd, width as i32, height as i32);
                     }
                 } else {
-                    nih_error!("Failed to find Druid window for host embedding");
+                    nih_error!("Failed to find Druid window for baseview embedding");
                 }
             }
+        } else {
+            nih_error!("Failed to get Win32 baseview parent handle for embedding");
         }
 
         #[cfg(target_os = "linux")]
-        if let ParentWindowHandle::X11Window(parent_xid) = parent {
-            let (width, height) = self.druid_state.size();
+        if let Some(parent_xid) = baseview_parent_xid {
             let child_xid = unsafe {
                 find_new_x11_window(
-                    parent_xid as u64,
+                    parent_xid,
                     existing_root_windows.as_deref().unwrap_or(&[]),
                     Duration::from_secs(5),
                 )
             };
             if let Some(child_xid) = child_xid {
                 unsafe {
-                    embed_x11_window(child_xid, parent_xid as u64, width, height);
+                    embed_x11_window(child_xid, parent_xid, width, height);
                 }
             } else {
-                nih_error!("Failed to find Druid window for host X11 embedding");
+                nih_error!("Failed to find Druid window for baseview X11 embedding");
             }
+        } else {
+            nih_error!("Failed to get X11 baseview parent handle for embedding");
         }
 
         #[cfg(target_os = "macos")]
-        if let ParentWindowHandle::AppKitNsView(parent_ns_view) = parent {
+        if let Some(parent_ns_view) = baseview_parent_ns_view {
             if let Some(child_window) = find_druid_window(Duration::from_secs(5)) {
                 let mut embedded = false;
-                // Host views are sometimes not fully initialized yet when spawn() returns.
                 for _ in 0..120 {
                     unsafe {
                         if embed_child_window_macos(child_window, parent_ns_view as id) {
@@ -458,17 +541,20 @@ where
                 }
 
                 if !embedded {
-                    nih_error!("Failed to embed Druid window into host AppKit view");
+                    nih_error!("Failed to embed Druid window into baseview AppKit view");
                 }
             } else {
-                nih_error!("Failed to find Druid window for host embedding");
+                nih_error!("Failed to find Druid window for baseview embedding");
             }
+        } else {
+            nih_error!("Failed to get AppKit baseview parent handle for embedding");
         }
 
         Box::new(DruidEditorHandle {
             druid_state: self.druid_state.clone(),
             event_sink: sink_receiver.recv_timeout(Duration::from_secs(2)).ok(),
             thread: Some(thread),
+            baseview_window: Some(baseview_window),
             owns_gui: true,
         })
     }
@@ -497,8 +583,11 @@ struct DruidEditorHandle {
     druid_state: Arc<DruidState>,
     event_sink: Option<ExtEventSink>,
     thread: Option<JoinHandle<()>>,
+    baseview_window: Option<BaseviewWindowHandle>,
     owns_gui: bool,
 }
+
+unsafe impl Send for DruidEditorHandle {}
 
 impl Drop for DruidEditorHandle {
     fn drop(&mut self) {
@@ -530,6 +619,10 @@ impl Drop for DruidEditorHandle {
             }
         } else {
             self.druid_state.open.store(false, Ordering::Release);
+        }
+
+        if let Some(baseview_window) = self.baseview_window.as_mut() {
+            baseview_window.close();
         }
     }
 }
