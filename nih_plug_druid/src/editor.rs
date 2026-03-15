@@ -1,5 +1,10 @@
 use crossbeam::atomic::AtomicCell;
-use druid::{commands, AppLauncher, ExtEventSink, Target};
+use druid::kurbo::{Affine, BezPath};
+use druid::{
+    commands, AppLauncher, BoxConstraints, Color, Cursor, Data, Env, Event, EventCtx,
+    ExtEventSink, LayoutCtx, LifeCycle, LifeCycleCtx, PaintCtx, Point, Rect, RenderContext,
+    Size, Target, UpdateCtx, Widget, WidgetPod, WindowConfig,
+};
 use nih_plug::debug::*;
 use nih_plug::prelude::{Editor, GuiContext, ParentWindowHandle};
 #[cfg(target_os = "macos")]
@@ -38,7 +43,294 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
-use crate::DruidState;
+use crate::{DruidState, ResizableScaleConfig};
+
+pub(crate) struct ResizableScale<T, W>
+where
+    T: Data,
+    W: Widget<T>,
+{
+    child: WidgetPod<T, W>,
+    druid_state: Arc<DruidState>,
+    context: Arc<dyn GuiContext>,
+    resize_config: ResizableScaleConfig,
+    drag_active: bool,
+    drag_start_pos: Point,
+    drag_start_window_size: Size,
+    last_applied_scale: f64,
+}
+
+impl<T, W> ResizableScale<T, W>
+where
+    T: Data,
+    W: Widget<T>,
+{
+    pub(crate) fn new(
+        druid_state: Arc<DruidState>,
+        context: Arc<dyn GuiContext>,
+        resize_config: ResizableScaleConfig,
+        child: W,
+    ) -> Self {
+        let mut resize_config = resize_config;
+        if !resize_config.handle_size.is_finite() || resize_config.handle_size <= 0.0 {
+            resize_config.handle_size = 18.0;
+        }
+
+        if !resize_config.min_scale_factor.is_finite() || resize_config.min_scale_factor <= 0.0 {
+            resize_config.min_scale_factor = 0.5;
+        }
+
+        if !resize_config.max_scale_factor.is_finite()
+            || resize_config.max_scale_factor < resize_config.min_scale_factor
+        {
+            resize_config.max_scale_factor = resize_config.min_scale_factor.max(4.0);
+        }
+
+        Self {
+            child: WidgetPod::new(child),
+            last_applied_scale: druid_state.user_scale_factor(),
+            druid_state,
+            context,
+            resize_config,
+            drag_active: false,
+            drag_start_pos: Point::ORIGIN,
+            drag_start_window_size: Size::ZERO,
+        }
+    }
+
+    fn current_scale(&self) -> f64 {
+        self.druid_state.user_scale_factor()
+    }
+
+    fn handle_rect(&self, size: Size) -> Rect {
+        Rect::from_origin_size(
+            Point::new(
+                (size.width - self.resize_config.handle_size).max(0.0),
+                (size.height - self.resize_config.handle_size).max(0.0),
+            ),
+            Size::new(self.resize_config.handle_size, self.resize_config.handle_size),
+        )
+    }
+
+    fn point_in_handle(&self, size: Size, point: Point) -> bool {
+        let rect = self.handle_rect(size);
+        if !rect.contains(point) {
+            return false;
+        }
+
+        let local_x = point.x - rect.x0;
+        let local_y = point.y - rect.y0;
+        local_x + local_y >= self.resize_config.handle_size
+    }
+
+    fn scaled_mouse_event(&self, mouse: &druid::MouseEvent) -> druid::MouseEvent {
+        let scale = self.current_scale();
+        let mut mouse = mouse.clone();
+        mouse.pos = Point::new(mouse.pos.x / scale, mouse.pos.y / scale);
+        mouse.window_pos = Point::new(mouse.window_pos.x / scale, mouse.window_pos.y / scale);
+        mouse
+    }
+
+    fn scaled_event(&self, event: &Event) -> Option<Event> {
+        match event {
+            Event::MouseDown(mouse) => Some(Event::MouseDown(self.scaled_mouse_event(mouse))),
+            Event::MouseMove(mouse) => Some(Event::MouseMove(self.scaled_mouse_event(mouse))),
+            Event::MouseUp(mouse) => Some(Event::MouseUp(self.scaled_mouse_event(mouse))),
+            Event::Wheel(mouse) => Some(Event::Wheel(self.scaled_mouse_event(mouse))),
+            Event::WindowSize(size) => Some(Event::WindowSize(Size::new(
+                size.width / self.current_scale(),
+                size.height / self.current_scale(),
+            ))),
+            _ => None,
+        }
+    }
+
+    fn resize_window_event(&mut self, ctx: &mut EventCtx, user_scale_factor: f64) {
+        let old_scale = self.druid_state.user_scale_factor();
+        let user_scale_factor = user_scale_factor.clamp(
+            self.resize_config.min_scale_factor,
+            self.resize_config.max_scale_factor,
+        );
+        self.druid_state.set_user_scale_factor(user_scale_factor);
+
+        if !self.context.request_resize() {
+            self.druid_state.set_user_scale_factor(old_scale);
+            self.last_applied_scale = old_scale;
+            return;
+        }
+
+        self.last_applied_scale = user_scale_factor;
+
+        let (width, height) = self.druid_state.size();
+        ctx.submit_command(
+            commands::CONFIGURE_WINDOW.with(
+                WindowConfig::default().window_size(Size::new(width as f64, height as f64)),
+            ),
+        );
+        ctx.request_layout();
+        ctx.request_paint();
+    }
+
+    fn sync_scale_change_event(&mut self, ctx: &mut EventCtx) {
+        let old_scale = self.last_applied_scale;
+        let current_scale = self.current_scale();
+        if (old_scale - current_scale).abs() <= f64::EPSILON {
+            return;
+        }
+
+        if !self.context.request_resize() {
+            self.druid_state.set_user_scale_factor(old_scale);
+            return;
+        }
+
+        self.last_applied_scale = current_scale;
+        let (width, height) = self.druid_state.size();
+        ctx.submit_command(
+            commands::CONFIGURE_WINDOW.with(
+                WindowConfig::default().window_size(Size::new(width as f64, height as f64)),
+            ),
+        );
+        ctx.request_layout();
+        ctx.request_paint();
+    }
+
+    fn sync_scale_change_update(&mut self, ctx: &mut UpdateCtx) {
+        let old_scale = self.last_applied_scale;
+        let current_scale = self.current_scale();
+        if (old_scale - current_scale).abs() <= f64::EPSILON {
+            return;
+        }
+
+        if !self.context.request_resize() {
+            self.druid_state.set_user_scale_factor(old_scale);
+            return;
+        }
+
+        self.last_applied_scale = current_scale;
+        let (width, height) = self.druid_state.size();
+        ctx.submit_command(
+            commands::CONFIGURE_WINDOW.with(
+                WindowConfig::default().window_size(Size::new(width as f64, height as f64)),
+            ),
+        );
+        ctx.request_layout();
+        ctx.request_paint();
+    }
+
+    fn paint_handle(&self, ctx: &mut PaintCtx) {
+        let rect = self.handle_rect(ctx.size());
+        let line_color = Color::grey8(160);
+
+        let mut outline = BezPath::new();
+        outline.move_to(Point::new(rect.x0, rect.y1));
+        outline.line_to(Point::new(rect.x1, rect.y1));
+        outline.line_to(Point::new(rect.x1, rect.y0));
+        ctx.stroke(outline, &Color::grey8(70), 1.0);
+
+        for offset in [4.0, 8.0, 12.0] {
+            ctx.stroke(
+                druid::kurbo::Line::new(
+                    Point::new(rect.x1 - offset, rect.y1),
+                    Point::new(rect.x1, rect.y1 - offset),
+                ),
+                &line_color,
+                1.5,
+            );
+        }
+    }
+}
+
+impl<T, W> Widget<T> for ResizableScale<T, W>
+where
+    T: Data,
+    W: Widget<T>,
+{
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut T, env: &Env) {
+        self.sync_scale_change_event(ctx);
+
+        match event {
+            Event::MouseDown(mouse) if self.point_in_handle(ctx.size(), mouse.pos) => {
+                self.drag_active = true;
+                self.drag_start_pos = mouse.pos;
+                self.drag_start_window_size = ctx.size();
+                ctx.set_active(true);
+                ctx.set_handled();
+                ctx.request_paint();
+                return;
+            }
+            Event::MouseMove(mouse) if self.drag_active => {
+                let (logical_width, logical_height) = self.druid_state.logical_size();
+                let new_width = (self.drag_start_window_size.width + mouse.pos.x - self.drag_start_pos.x)
+                    .max(logical_width as f64 * self.resize_config.min_scale_factor);
+                let new_height = (self.drag_start_window_size.height + mouse.pos.y - self.drag_start_pos.y)
+                    .max(logical_height as f64 * self.resize_config.min_scale_factor);
+                let new_scale = (new_width / logical_width as f64)
+                    .max(new_height / logical_height as f64);
+
+                self.resize_window_event(ctx, new_scale);
+                ctx.set_handled();
+                return;
+            }
+            Event::MouseMove(mouse) => {
+                if self.point_in_handle(ctx.size(), mouse.pos) {
+                    ctx.set_cursor(&Cursor::ResizeLeftRight);
+                }
+            }
+            Event::MouseUp(_) if self.drag_active => {
+                self.drag_active = false;
+                ctx.set_active(false);
+                ctx.set_handled();
+                ctx.request_paint();
+                return;
+            }
+            _ => {}
+        }
+
+        if let Some(scaled_event) = self.scaled_event(event) {
+            self.child.event(ctx, &scaled_event, data, env);
+        } else {
+            self.child.event(ctx, event, data, env);
+        }
+    }
+
+    fn lifecycle(&mut self, ctx: &mut LifeCycleCtx, event: &LifeCycle, data: &T, env: &Env) {
+        self.child.lifecycle(ctx, event, data, env);
+    }
+
+    fn update(&mut self, ctx: &mut UpdateCtx, old_data: &T, data: &T, env: &Env) {
+        self.sync_scale_change_update(ctx);
+
+        self.child.update(ctx, data, env);
+        if !old_data.same(data) {
+            return;
+        }
+
+        if ctx.env_changed() {
+            ctx.request_paint();
+        }
+    }
+
+    fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints, data: &T, env: &Env) -> Size {
+        let scale = self.current_scale();
+        let child_bc = BoxConstraints::new(
+            Size::new(bc.min().width / scale, bc.min().height / scale),
+            Size::new(bc.max().width / scale, bc.max().height / scale),
+        );
+        let child_size = self.child.layout(ctx, &child_bc, data, env);
+        self.child.set_origin(ctx, Point::ORIGIN);
+
+        bc.constrain(Size::new(child_size.width * scale, child_size.height * scale))
+    }
+
+    fn paint(&mut self, ctx: &mut PaintCtx, data: &T, env: &Env) {
+        ctx.with_save(|ctx| {
+            ctx.transform(Affine::scale(self.current_scale()));
+            self.child.paint(ctx, data, env);
+        });
+
+        self.paint_handle(ctx);
+    }
+}
 
 pub(crate) struct DruidEditor<T>
 where

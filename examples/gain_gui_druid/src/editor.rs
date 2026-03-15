@@ -4,7 +4,9 @@ use druid::widget::prelude::*;
 use druid::widget::{Button, Flex, Label, Slider};
 use druid::{Color, Data, Event, EventCtx, Lens, Point, TimerToken, Widget, WidgetExt, WindowDesc};
 use nih_plug::prelude::{util, Editor, Param, ParamSetter};
-use nih_plug_druid::{create_druid_editor, DruidState};
+use nih_plug_druid::{
+    create_druid_editor, wrap_with_scale, DruidState, ResizableScaleConfig,
+};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +14,9 @@ use std::time::Duration;
 use crate::GainParams;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
+const RESIZE_HANDLE_SIZE: f64 = 18.0;
+const MIN_USER_SCALE_FACTOR: f64 = 0.9;
+const MAX_USER_SCALE_FACTOR: f64 = 3.5;
 
 #[derive(Clone, Data, Lens)]
 struct UiData {
@@ -267,6 +272,17 @@ pub(crate) fn create(
                     context: context.clone(),
                     timer_id: TimerToken::INVALID,
                 });
+
+            let content = wrap_with_scale(
+                editor_state.clone(),
+                context.clone(),
+                ResizableScaleConfig {
+                    handle_size: RESIZE_HANDLE_SIZE,
+                    min_scale_factor: MIN_USER_SCALE_FACTOR,
+                    max_scale_factor: MAX_USER_SCALE_FACTOR,
+                },
+                content,
+            );
 
             let (width, height) = editor_state.size();
             WindowDesc::new(content)
