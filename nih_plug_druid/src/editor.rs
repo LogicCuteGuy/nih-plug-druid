@@ -268,12 +268,15 @@ where
                     .max(new_height / logical_height as f64);
 
                 self.resize_window_event(ctx, new_scale);
+                ctx.set_cursor(&Cursor::ResizeLeftRight);
                 ctx.set_handled();
                 return;
             }
             Event::MouseMove(mouse) => {
                 if self.point_in_handle(ctx.size(), mouse.pos) {
                     ctx.set_cursor(&Cursor::ResizeLeftRight);
+                } else {
+                    ctx.clear_cursor();
                 }
             }
             Event::MouseUp(_) if self.drag_active => {

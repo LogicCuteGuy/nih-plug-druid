@@ -2,7 +2,7 @@ use atomic_float::AtomicF32;
 use druid::widget::Controller;
 use druid::widget::prelude::*;
 use druid::widget::{Button, Flex, Label, Slider};
-use druid::{Color, Data, Event, EventCtx, Lens, Point, TimerToken, Widget, WidgetExt, WindowDesc};
+use druid::{Color, Cursor, Data, Event, EventCtx, Lens, Point, TimerToken, Widget, WidgetExt, WindowDesc};
 use nih_plug::prelude::{util, Editor, Param, ParamSetter};
 use nih_plug_druid::{
     create_druid_editor, wrap_with_scale, DruidState, ResizableScaleConfig,
@@ -87,6 +87,27 @@ impl<W: Widget<UiData>> Controller<UiData, W> for PollController {
     }
 }
 
+struct HoverPointerController;
+
+impl<T: Data, W: Widget<T>> Controller<T, W> for HoverPointerController {
+    fn event(
+        &mut self,
+        child: &mut W,
+        ctx: &mut EventCtx,
+        event: &Event,
+        data: &mut T,
+        env: &druid::Env,
+    ) {
+        if let Event::MouseMove(_) = event {
+            if ctx.is_hot() {
+                ctx.set_cursor(&Cursor::Pointer);
+            }
+        }
+
+        child.event(ctx, event, data, env);
+    }
+}
+
 struct KnobWidget {
     drag_anchor_y: f64,
     drag_anchor_value: f64,
@@ -104,8 +125,8 @@ impl KnobWidget {
 
     fn value_to_angle(value: f64) -> f64 {
         let normalized = ((value + 30.0) / 60.0).clamp(0.0, 1.0);
-        let start = -2.35;
-        let end = 0.75;
+        let start = (-225.0_f64).to_radians();
+        let end = 45.0_f64.to_radians();
         start + normalized * (end - start)
     }
 }
@@ -212,9 +233,12 @@ pub(crate) fn create(
                 .with_range(-30.0, 30.0)
                 .with_step(0.1)
                 .expand_width()
+                .controller(HoverPointerController)
                 .lens(UiData::gain_db);
 
-            let knob = KnobWidget::new().lens(UiData::gain_db);
+            let knob = KnobWidget::new()
+                .controller(HoverPointerController)
+                .lens(UiData::gain_db);
 
             let minus_params = params.clone();
             let minus_context = context.clone();
@@ -225,7 +249,8 @@ pub(crate) fn create(
                 setter.set_parameter(&minus_params.gain, util::db_to_gain(new_db));
                 setter.end_set_parameter(&minus_params.gain);
                 data.gain_db = new_db as f64;
-            });
+            })
+            .controller(HoverPointerController);
 
             let plus_params = params.clone();
             let plus_context = context.clone();
@@ -236,7 +261,8 @@ pub(crate) fn create(
                 setter.set_parameter(&plus_params.gain, util::db_to_gain(new_db));
                 setter.end_set_parameter(&plus_params.gain);
                 data.gain_db = new_db as f64;
-            });
+            })
+            .controller(HoverPointerController);
 
             let content = Flex::column()
                 .with_child(Label::new("Gain GUI (Druid)").center())
