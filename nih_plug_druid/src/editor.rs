@@ -10,7 +10,7 @@ use nih_plug::debug::*;
 use nih_plug::prelude::{Editor, GuiContext, ParentWindowHandle};
 use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 #[cfg(target_os = "macos")]
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, c_void, CStr};
 #[cfg(target_os = "linux")]
 use std::ffi::CStr;
 use std::sync::atomic::Ordering;
